@@ -1,5 +1,8 @@
+import { authenticateRequest } from "./auth";
+
 export interface Env {
   KV: KVNamespace;
+  GATEWAY_API_KEY: string;
 }
 
 function jsonResponse(body: object, status = 200): Response {
@@ -27,6 +30,11 @@ export default {
 
     if (path === "/health") {
       return handleHealth();
+    }
+
+    const authenticated = authenticateRequest(request, env.GATEWAY_API_KEY);
+    if (authenticated instanceof Response) {
+      return authenticated;
     }
 
     if (path.startsWith("/v1/")) {
