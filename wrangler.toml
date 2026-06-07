@@ -1,3 +1,7 @@
 name = "daedalus"
 main = "src/index.ts"
-compatibility_date = "2025-05-28"
+compatibility_date = "2025-05-8"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
