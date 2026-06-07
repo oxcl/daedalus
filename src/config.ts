@@ -78,6 +78,7 @@ export async function loadConfigs(
 
 export interface ModelIndex {
   resolve(modelName: string): ModelResolution;
+  resolveAll(modelName: string): ModelResolution[];
 }
 
 export function buildModelIndex(
@@ -128,6 +129,35 @@ export function buildModelIndex(
         throw new ModelNotFoundError(modelName);
       }
       return resolution;
+    },
+
+    resolveAll(modelName: string): ModelResolution[] {
+      const atIdx = modelName.indexOf("@");
+      if (atIdx !== -1) {
+        const provider = modelName.slice(0, atIdx);
+        const name = modelName.slice(atIdx + 1);
+        const providerModels = prefixedIndex.get(provider);
+        if (!providerModels) {
+          throw new ModelNotFoundError(modelName);
+        }
+        const resolution = providerModels.get(name);
+        if (!resolution) {
+          throw new ModelNotFoundError(modelName);
+        }
+        return [resolution];
+      }
+
+      const results: ModelResolution[] = [];
+      for (const [, providerModels] of prefixedIndex) {
+        const resolution = providerModels.get(modelName);
+        if (resolution) {
+          results.push(resolution);
+        }
+      }
+      if (results.length === 0) {
+        throw new ModelNotFoundError(modelName);
+      }
+      return results;
     },
   };
 }

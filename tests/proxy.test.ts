@@ -258,3 +258,243 @@ describe("handleChatCompletions", () => {
     expect(body.error.type).toBe("rate_limit_error");
   });
 });
+
+describe("SSE streaming passthrough", () => {
+  const sseBody = [
+    "data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}",
+    "",
+    "data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":null}]}",
+    "",
+    "data: [DONE]",
+    "",
+  ].join("\n");
+
+  it("forwards SSE stream with correct Content-Type", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(sseBody, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    );
+
+    const req = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+      stream: true,
+    });
+    const res = await handleChatCompletions(req, modelIndex);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    expect(await res.text()).toBe(sseBody);
+  });
+
+  it("pipes SSE stream directly without buffering", async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("data: token1\n\n"));
+        controller.enqueue(new TextEncoder().encode("data: token2\n\n"));
+        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    );
+
+    const req = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+      stream: true,
+    });
+    const res = await handleChatCompletions(req, modelIndex);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+
+    const reader = res.body!.getReader();
+    const chunks: string[] = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(new TextDecoder().decode(value));
+    }
+    expect(chunks).toEqual([
+      "data: token1\n\n",
+      "data: token2\n\n",
+      "data: [DONE]\n\n",
+    ]);
+  });
+
+  it("fails immediately on mid-stream connection error (no retry)", async () => {
+    let callCount = 0;
+    fetchSpy.mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        // First call: return a stream that errors mid-way
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("data: token1\n\n"));
+            controller.error(new Error("connection lost"));
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      // Should not be called
+      return new Response("should not reach", { status: 200 });
+    });
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+      stream: true,
+    });
+    const res = await handleChatCompletions(req, modelIndex);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+
+    // Reading the stream should throw due to mid-stream error
+    const reader = res.body!.getReader();
+    await expect(reader.read()).rejects.toThrow();
+
+    // Only one fetch call — no retry after mid-stream error
+    expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+
+  it("retries with next provider on error before tokens", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Overloaded", type: "server_error" } }),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(sseBody, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        }),
+      );
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+      stream: true,
+    });
+    const res = await handleChatCompletions(req, modelIndex);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    // First call to openai, second to deepseek
+    const firstReq = fetchSpy.mock.calls[0][0] as Request;
+    expect(firstReq.url).toBe("https://api.openai.com/v1/chat/completions");
+    const secondReq = fetchSpy.mock.calls[1][0] as Request;
+    expect(secondReq.url).toBe("https://api.deepseek.com/v1/chat/completions");
+  });
+
+  it("retries on connection error before any response", async () => {
+    fetchSpy
+      .mockRejectedValueOnce(new Error("connection refused"))
+      .mockResolvedValueOnce(
+        new Response(sseBody, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        }),
+      );
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+      stream: true,
+    });
+    const res = await handleChatCompletions(req, modelIndex);
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns error when all providers fail for streaming request", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Overloaded", type: "server_error" } }),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Overloaded", type: "server_error" } }),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+      stream: true,
+    });
+    const res = await handleChatCompletions(req, modelIndex);
+
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.error.type).toBe("server_error");
+  });
+
+  it("non-streaming responses still work correctly", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify(upstreamResponse), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const req = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+      stream: false,
+    });
+    const res = await handleChatCompletions(req, modelIndex);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json");
+    const body = await res.json();
+    expect(body).toEqual(upstreamResponse);
+  });
+
+  it("retries on error before tokens for non-streaming requests", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Overloaded", type: "server_error" } }),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(upstreamResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex);
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    const body = await res.json();
+    expect(body).toEqual(upstreamResponse);
+  });
+});

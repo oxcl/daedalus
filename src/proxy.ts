@@ -1,4 +1,4 @@
-import { type ModelIndex, ModelNotFoundError } from "./config";
+import { type ModelIndex, type ProviderConfig, ModelNotFoundError } from "./config";
 
 function openaiError(message: string, status: number): Response {
   return new Response(
@@ -7,6 +7,74 @@ function openaiError(message: string, status: number): Response {
     }),
     { status, headers: { "Content-Type": "application/json" } },
   );
+}
+
+function buildUpstreamRequest(
+  url: string,
+  body: Record<string, unknown>,
+  providerConfig: ProviderConfig,
+  providerModelName: string,
+): Request {
+  const upstreamUrl = `${url.replace(/\/+$/, "")}/chat/completions`;
+  const apiKey = providerConfig.apiKeys[providerConfig.activeKeyIndex];
+  const upstreamBody = { ...body, model: providerModelName };
+
+  return new Request(upstreamUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(upstreamBody),
+  });
+}
+
+async function tryProvider(
+  upstreamRequest: Request,
+  isStreaming: boolean,
+): Promise<
+  | { ok: true; response: Response }
+  | { ok: false; error?: Response }
+> {
+  let response: Response;
+  try {
+    response = await fetch(upstreamRequest);
+  } catch {
+    // Connection error before any response — retryable
+    return { ok: false };
+  }
+
+  if (!isStreaming) {
+    // Buffer the full response to check for errors
+    const body = await response.text();
+    if (response.ok) {
+      return {
+        ok: true,
+        response: new Response(body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        }),
+      };
+    }
+    // Non-2xx — error before tokens sent, retryable
+    // Return the error response so the caller can pass it through
+    return {
+      ok: false,
+      error: new Response(body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      }),
+    };
+  }
+
+  // Streaming: 2xx means streaming has started — committed
+  // Non-2xx means error before tokens — retryable
+  if (response.ok) {
+    return { ok: true, response };
+  }
+  return { ok: false, error: response };
 }
 
 export async function handleChatCompletions(
@@ -25,9 +93,9 @@ export async function handleChatCompletions(
     return openaiError("model field is required", 400);
   }
 
-  let resolution;
+  let resolutions;
   try {
-    resolution = modelIndex.resolve(model);
+    resolutions = modelIndex.resolveAll(model);
   } catch (e) {
     if (e instanceof ModelNotFoundError) {
       return openaiError(e.message, 404);
@@ -35,20 +103,30 @@ export async function handleChatCompletions(
     return openaiError("Internal error resolving model", 500);
   }
 
-  const { providerConfig, providerModelName } = resolution;
-  const upstreamUrl = `${providerConfig.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const apiKey = providerConfig.apiKeys[providerConfig.activeKeyIndex];
+  const isStreaming = body.stream === true;
 
-  const upstreamBody = { ...body, model: providerModelName };
+  for (let i = 0; i < resolutions.length; i++) {
+    const resolution = resolutions[i];
+    const upstreamRequest = buildUpstreamRequest(
+      resolution.providerConfig.baseUrl,
+      body,
+      resolution.providerConfig,
+      resolution.providerModelName,
+    );
 
-  const upstreamRequest = new Request(upstreamUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(upstreamBody),
-  });
+    const result = await tryProvider(upstreamRequest, isStreaming);
+    if (result.ok) {
+      return result.response;
+    }
 
-  return fetch(upstreamRequest);
+    // Last provider — return upstream error directly
+    if (i === resolutions.length - 1) {
+      return result.error ?? openaiError(
+        `Provider '${resolution.provider}' connection failed`,
+        502,
+      );
+    }
+  }
+
+  return openaiError("No providers available", 502);
 }

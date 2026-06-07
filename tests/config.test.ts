@@ -234,6 +234,58 @@ describe("buildModelIndex", () => {
     const resolution = index.resolve("gpt-4o");
     expect(resolution.providerConfig).toBe(openaiConfig);
   });
+
+  it("resolveAll returns all providers for a generic model", () => {
+    const configs = new Map([
+      ["openai", openaiConfig],
+      ["deepseek", deepseekConfig],
+    ]);
+    const index = buildModelIndex(configs);
+
+    const resolutions = index.resolveAll("o1");
+    expect(resolutions).toHaveLength(2);
+    expect(resolutions[0].provider).toBe("openai");
+    expect(resolutions[1].provider).toBe("deepseek");
+  });
+
+  it("resolveAll returns single provider for unique model", () => {
+    const configs = new Map([
+      ["openai", openaiConfig],
+      ["deepseek", deepseekConfig],
+    ]);
+    const index = buildModelIndex(configs);
+
+    const resolutions = index.resolveAll("gpt-4o");
+    expect(resolutions).toHaveLength(1);
+    expect(resolutions[0].provider).toBe("openai");
+  });
+
+  it("resolveAll returns single resolution for prefixed model", () => {
+    const configs = new Map([
+      ["openai", openaiConfig],
+      ["deepseek", deepseekConfig],
+    ]);
+    const index = buildModelIndex(configs);
+
+    const resolutions = index.resolveAll("openai@o1");
+    expect(resolutions).toHaveLength(1);
+    expect(resolutions[0].provider).toBe("openai");
+    expect(resolutions[0].providerModelName).toBe("o1-2024-12-17");
+  });
+
+  it("resolveAll throws ModelNotFoundError for unknown model", () => {
+    const configs = new Map([["openai", openaiConfig]]);
+    const index = buildModelIndex(configs);
+
+    expect(() => index.resolveAll("nonexistent")).toThrow(ModelNotFoundError);
+  });
+
+  it("resolveAll throws ModelNotFoundError for unknown provider prefix", () => {
+    const configs = new Map([["openai", openaiConfig]]);
+    const index = buildModelIndex(configs);
+
+    expect(() => index.resolveAll("unknown@gpt-4o")).toThrow(ModelNotFoundError);
+  });
 });
 
 describe("model resolution integration", () => {
