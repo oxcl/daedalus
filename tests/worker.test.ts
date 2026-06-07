@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import worker from "../src/index";
+import type { Env } from "../src/index";
 
 const env = { KV: {} as KVNamespace } as Env;
 
