@@ -1,3 +1,5 @@
+import { Storage } from "./storage";
+
 export interface ProviderModelEntry {
   name: string;
   providerName: string;
@@ -25,7 +27,7 @@ function normalizeModelEntry(
   return { name: entry.name, providerName: entry.providerName };
 }
 
-function parseProviderConfig(raw: unknown): ProviderConfig {
+function parseProviderConfig(raw: Record<string, unknown>): ProviderConfig {
   const config = raw as Record<string, unknown>;
 
   if (!config || typeof config !== "object") {
@@ -56,24 +58,21 @@ function parseProviderConfig(raw: unknown): ProviderConfig {
 }
 
 export async function loadConfigs(
-  kv: KVNamespace,
+  storage: Storage,
 ): Promise<Map<string, ProviderConfig>> {
-  const configs = new Map<string, ProviderConfig>();
-  const list = await kv.list({ prefix: "provider:" });
+  return storage.listConfigs();
+}
 
-  for (const key of list.keys) {
-    const providerName = key.name.replace(/^provider:/, "");
-    const raw = await kv.get(key.name, "json");
-    if (raw) {
-      try {
-        configs.set(providerName, parseProviderConfig(raw));
-      } catch {
-        // skip invalid configs
-      }
-    }
+export async function updateActiveKeyIndex(
+  storage: Storage,
+  providerName: string,
+  activeKeyIndex: number,
+): Promise<void> {
+  const config = await storage.getConfig(providerName);
+  if (!config) {
+    return;
   }
-
-  return configs;
+  await storage.putKeys(providerName, config.apiKeys, activeKeyIndex);
 }
 
 export interface ModelIndex {

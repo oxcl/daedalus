@@ -1,5 +1,10 @@
 node_modules/
 .wrangler/
 .dev.vars
+.env
 .opencode/
 opencode.json
+data/
+dist/
+*.log
+result

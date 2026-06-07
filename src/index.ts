@@ -1,10 +1,41 @@
-import { authenticateRequest } from "./auth";
 import { loadConfigs, buildModelIndex } from "./config";
 import { handleChatCompletions } from "./proxy";
+import { Storage } from "./storage";
 
-export interface Env {
-  KV: KVNamespace;
-  GATEWAY_API_KEY: string;
+export async function fetchHandler(
+  request: Request,
+  storage: Storage,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  if (path === "/health") {
+    return handleHealth();
+  }
+
+  if (path === "/v1/models" && request.method === "GET") {
+    const configs = await loadConfigs(storage);
+    const data: { id: string; object: string; owned_by: string }[] = [];
+    const seenGeneric = new Set<string>();
+    for (const [provider, config] of configs) {
+      for (const model of config.models) {
+        data.push({ id: `${provider}@${model.name}`, object: "model", owned_by: provider });
+        if (!seenGeneric.has(model.name)) {
+          seenGeneric.add(model.name);
+          data.push({ id: model.name, object: "model", owned_by: provider });
+        }
+      }
+    }
+    return jsonResponse({ object: "list", data });
+  }
+
+  if (path === "/v1/chat/completions" && request.method === "POST") {
+    const configs = await loadConfigs(storage);
+    const modelIndex = buildModelIndex(configs);
+    return handleChatCompletions(request, modelIndex, storage);
+  }
+
+  return handleNotFound();
 }
 
 function jsonResponse(body: object, status = 200): Response {
@@ -24,43 +55,3 @@ function handleNotFound(): Response {
     404,
   );
 }
-
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    if (path === "/health") {
-      return handleHealth();
-    }
-
-    const authenticated = authenticateRequest(request, env.GATEWAY_API_KEY);
-    if (authenticated instanceof Response) {
-      return authenticated;
-    }
-
-    if (path === "/v1/models" && request.method === "GET") {
-      const configs = await loadConfigs(env.KV);
-      const data: { id: string; object: string; owned_by: string }[] = [];
-      const seenGeneric = new Set<string>();
-      for (const [provider, config] of configs) {
-        for (const model of config.models) {
-          data.push({ id: `${provider}@${model.name}`, object: "model", owned_by: provider });
-          if (!seenGeneric.has(model.name)) {
-            seenGeneric.add(model.name);
-            data.push({ id: model.name, object: "model", owned_by: provider });
-          }
-        }
-      }
-      return jsonResponse({ object: "list", data });
-    }
-
-    if (path === "/v1/chat/completions" && request.method === "POST") {
-      const configs = await loadConfigs(env.KV);
-      const modelIndex = buildModelIndex(configs);
-      return handleChatCompletions(authenticated, modelIndex);
-    }
-
-    return handleNotFound();
-  },
-};

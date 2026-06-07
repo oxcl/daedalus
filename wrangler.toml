@@ -1,7 +1,0 @@
-name = "daedalus"
-main = "src/index.ts"
-compatibility_date = "2025-05-08"
-
-[[kv_namespaces]]
-binding = "KV"
-id = "2c28b4a9c948452baee3f339f250a0a7"

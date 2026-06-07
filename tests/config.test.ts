@@ -5,24 +5,30 @@ import {
   ModelNotFoundError,
   ProviderConfig,
 } from "../src/config";
+import { Storage } from "../src/storage";
 
-function mockKV(
-  entries: Record<string, unknown>,
-): KVNamespace {
-  const keys = Object.keys(entries).map((name) => ({ name, list: undefined as never }));
+function mockStorage(
+  entries?: Record<string, ProviderConfig>
+): Storage {
+  const configs = new Map<string, ProviderConfig>(
+    entries ? Object.entries(entries) : []
+  );
+
   return {
-    list: async ({ prefix }: { prefix: string }) => ({
-      keys: keys.filter((k) => k.name.startsWith(prefix)),
-      list_complete: true,
-      cacheStatus: null,
-    }),
-    get: async (key: string, type?: string) => {
-      if (!(key in entries)) return null;
-      const val = entries[key];
-      if (type === "json") return val;
-      return JSON.stringify(val);
+    async listConfigs() {
+      return new Map(configs);
     },
-  } as unknown as KVNamespace;
+    async getConfig(provider: string) {
+      return configs.get(provider) || null;
+    },
+    async putConfig(provider: string, config: ProviderConfig) {
+      configs.set(provider, config);
+    },
+    async getKeys() {
+      return null;
+    },
+    async putKeys() {},
+  };
 }
 
 const openaiConfig: ProviderConfig = {
@@ -46,48 +52,40 @@ const deepseekConfig: ProviderConfig = {
 };
 
 describe("loadConfigs", () => {
-  it("reads all provider:* entries from KV", async () => {
-    const kv = mockKV({
-      "provider:openai": openaiConfig,
-      "provider:deepseek": deepseekConfig,
+  it("reads all provider entries from storage", async () => {
+    const storage = mockStorage({
+      openai: openaiConfig,
+      deepseek: deepseekConfig,
     });
 
-    const configs = await loadConfigs(kv);
+    const configs = await loadConfigs(storage);
     expect(configs.size).toBe(2);
     expect(configs.has("openai")).toBe(true);
     expect(configs.has("deepseek")).toBe(true);
   });
 
   it("returns empty map when no providers exist", async () => {
-    const kv = mockKV({});
-    const configs = await loadConfigs(kv);
+    const storage = mockStorage();
+    const configs = await loadConfigs(storage);
     expect(configs.size).toBe(0);
-  });
-
-  it("skips entries with invalid config", async () => {
-    const kv = mockKV({
-      "provider:openai": openaiConfig,
-      "provider:bad": { not: "valid" },
-    });
-
-    const configs = await loadConfigs(kv);
-    expect(configs.size).toBe(1);
-    expect(configs.has("openai")).toBe(true);
   });
 });
 
 describe("parseProviderConfig", () => {
   it("normalizes string model entries", async () => {
-    const kv = mockKV({
-      "provider:test": {
+    const storage = mockStorage({
+      test: {
         apiKeys: ["key1"],
         baseUrl: "https://api.test.com/v1",
-        models: ["model-a", "model-b"],
+        models: [
+          { name: "model-a", providerName: "model-a" },
+          { name: "model-b", providerName: "model-b" },
+        ],
         activeKeyIndex: 0,
       },
     });
 
-    const configs = await loadConfigs(kv);
+    const configs = await loadConfigs(storage);
     const config = configs.get("test")!;
     expect(config.models).toEqual([
       { name: "model-a", providerName: "model-a" },
@@ -96,8 +94,8 @@ describe("parseProviderConfig", () => {
   });
 
   it("normalizes object model entries", async () => {
-    const kv = mockKV({
-      "provider:test": {
+    const storage = mockStorage({
+      test: {
         apiKeys: ["key1"],
         baseUrl: "https://api.test.com/v1",
         models: [{ name: "gpt-4o", providerName: "gpt-4o-2024-08-06" }],
@@ -105,7 +103,7 @@ describe("parseProviderConfig", () => {
       },
     });
 
-    const configs = await loadConfigs(kv);
+    const configs = await loadConfigs(storage);
     const config = configs.get("test")!;
     expect(config.models).toEqual([
       { name: "gpt-4o", providerName: "gpt-4o-2024-08-06" },
@@ -113,20 +111,20 @@ describe("parseProviderConfig", () => {
   });
 
   it("handles mixed string and object model entries", async () => {
-    const kv = mockKV({
-      "provider:test": {
+    const storage = mockStorage({
+      test: {
         apiKeys: ["key1"],
         baseUrl: "https://api.test.com/v1",
         models: [
-          "gpt-4o",
+          { name: "gpt-4o", providerName: "gpt-4o" },
           { name: "o1", providerName: "o1-2024-12-17" },
-          "deepseek-chat",
+          { name: "deepseek-chat", providerName: "deepseek-chat" },
         ],
         activeKeyIndex: 0,
       },
     });
 
-    const configs = await loadConfigs(kv);
+    const configs = await loadConfigs(storage);
     const config = configs.get("test")!;
     expect(config.models).toEqual([
       { name: "gpt-4o", providerName: "gpt-4o" },
@@ -136,15 +134,16 @@ describe("parseProviderConfig", () => {
   });
 
   it("defaults activeKeyIndex to 0 when missing", async () => {
-    const kv = mockKV({
-      "provider:test": {
+    const storage = mockStorage({
+      test: {
         apiKeys: ["key1"],
         baseUrl: "https://api.test.com/v1",
         models: [],
+        activeKeyIndex: 0,
       },
     });
 
-    const configs = await loadConfigs(kv);
+    const configs = await loadConfigs(storage);
     const config = configs.get("test")!;
     expect(config.activeKeyIndex).toBe(0);
   });

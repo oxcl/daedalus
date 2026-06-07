@@ -1,6 +1,37 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { buildModelIndex, ProviderConfig } from "../src/config";
-import { handleChatCompletions } from "../src/proxy";
+import { handleChatCompletions, setDelayFn, resetDelayFn } from "../src/proxy";
+import { Storage } from "../src/storage";
+
+function mockStorage(
+  entries?: Record<string, ProviderConfig>
+): Storage {
+  const configs = new Map<string, ProviderConfig>(
+    entries ? Object.entries(entries) : []
+  );
+  const keysMap = new Map<string, { apiKeys: string[]; activeKeyIndex: number }>();
+
+  return {
+    async listConfigs() {
+      return new Map(configs);
+    },
+    async getConfig(provider: string) {
+      return configs.get(provider) || null;
+    },
+    async putConfig(provider: string, config: ProviderConfig) {
+      configs.set(provider, config);
+      if (!keysMap.has(provider)) {
+        keysMap.set(provider, { apiKeys: config.apiKeys, activeKeyIndex: config.activeKeyIndex });
+      }
+    },
+    async getKeys(provider: string) {
+      return keysMap.get(provider) || null;
+    },
+    async putKeys(provider: string, apiKeys: string[], activeKeyIndex: number) {
+      keysMap.set(provider, { apiKeys, activeKeyIndex });
+    },
+  };
+}
 
 const openaiConfig: ProviderConfig = {
   apiKeys: ["sk-openai-1", "sk-openai-2"],
@@ -45,6 +76,7 @@ const upstreamResponse = {
 
 let fetchSpy: ReturnType<typeof vi.fn>;
 let originalFetch: typeof globalThis.fetch;
+let delaySpy: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   originalFetch = globalThis.fetch;
@@ -54,20 +86,30 @@ beforeEach(() => {
       headers: { "Content-Type": "application/json" },
     }),
   );
-  globalThis.fetch = fetchSpy;
+  globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
+
+  delaySpy = vi.fn().mockResolvedValue(undefined);
+  setDelayFn(delaySpy as unknown as (ms: number) => Promise<void>);
 });
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  resetDelayFn();
+  vi.restoreAllMocks();
 });
 
-function makeRequest(
-  body: Record<string, unknown>,
-): Request {
+function makeRequest(body: Record<string, unknown>): Request {
   return new Request("http://localhost/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+  });
+}
+
+function makeStorage() {
+  return mockStorage({
+    openai: { ...openaiConfig },
+    deepseek: { ...deepseekConfig },
   });
 }
 
@@ -77,7 +119,7 @@ describe("handleChatCompletions", () => {
       model: "gpt-4o",
       messages: [{ role: "user", content: "Hi" }],
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(200);
     expect(fetchSpy).toHaveBeenCalledOnce();
@@ -90,7 +132,7 @@ describe("handleChatCompletions", () => {
       model: "gpt-4o",
       messages: [{ role: "user", content: "Hi" }],
     });
-    await handleChatCompletions(req, modelIndex);
+    await handleChatCompletions(req, modelIndex, makeStorage());
 
     const upstreamReq = fetchSpy.mock.calls[0][0] as Request;
     expect(upstreamReq.headers.get("Authorization")).toBe("Bearer sk-openai-1");
@@ -101,7 +143,7 @@ describe("handleChatCompletions", () => {
       model: "gpt-4o",
       messages: [{ role: "user", content: "Hi" }],
     });
-    await handleChatCompletions(req, modelIndex);
+    await handleChatCompletions(req, modelIndex, makeStorage());
 
     const upstreamReq = fetchSpy.mock.calls[0][0] as Request;
     expect(upstreamReq.url).toBe("https://api.openai.com/v1/chat/completions");
@@ -112,7 +154,7 @@ describe("handleChatCompletions", () => {
       model: "openai@o1",
       messages: [{ role: "user", content: "Hi" }],
     });
-    await handleChatCompletions(req, modelIndex);
+    await handleChatCompletions(req, modelIndex, makeStorage());
 
     const upstreamReq = fetchSpy.mock.calls[0][0] as Request;
     const upstreamBody = await upstreamReq.json();
@@ -124,7 +166,7 @@ describe("handleChatCompletions", () => {
       model: "o1",
       messages: [{ role: "user", content: "Hi" }],
     });
-    await handleChatCompletions(req, modelIndex);
+    await handleChatCompletions(req, modelIndex, makeStorage());
 
     const upstreamReq = fetchSpy.mock.calls[0][0] as Request;
     const upstreamBody = await upstreamReq.json();
@@ -136,7 +178,7 @@ describe("handleChatCompletions", () => {
       model: "nonexistent-model",
       messages: [{ role: "user", content: "Hi" }],
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(404);
     const body = await res.json();
@@ -151,7 +193,7 @@ describe("handleChatCompletions", () => {
       model: "unknown@gpt-4o",
       messages: [{ role: "user", content: "Hi" }],
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(404);
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -161,7 +203,7 @@ describe("handleChatCompletions", () => {
     const req = makeRequest({
       messages: [{ role: "user", content: "Hi" }],
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(400);
     const body = await res.json();
@@ -174,7 +216,7 @@ describe("handleChatCompletions", () => {
       model: "",
       messages: [{ role: "user", content: "Hi" }],
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(400);
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -186,7 +228,7 @@ describe("handleChatCompletions", () => {
       headers: { "Content-Type": "application/json" },
       body: "not valid json",
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(400);
     const body = await res.json();
@@ -203,7 +245,7 @@ describe("handleChatCompletions", () => {
       tools: [{ type: "function", function: { name: "test" } }],
       stream: true,
     });
-    await handleChatCompletions(req, modelIndex);
+    await handleChatCompletions(req, modelIndex, makeStorage());
 
     const upstreamReq = fetchSpy.mock.calls[0][0] as Request;
     const upstreamBody = await upstreamReq.json();
@@ -233,25 +275,32 @@ describe("handleChatCompletions", () => {
       model: "gpt-4o",
       messages: [{ role: "user", content: "Hi" }],
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual(customResponse);
   });
 
   it("passes through upstream error status codes", async () => {
-    fetchSpy.mockResolvedValueOnce(
-      new Response(
-        JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
-        { status: 429, headers: { "Content-Type": "application/json" } },
-      ),
-    );
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          { status: 429, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          { status: 429, headers: { "Content-Type": "application/json" } },
+        ),
+      );
 
     const req = makeRequest({
       model: "gpt-4o",
       messages: [{ role: "user", content: "Hi" }],
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(429);
     const body = await res.json();
@@ -282,7 +331,7 @@ describe("SSE streaming passthrough", () => {
       messages: [{ role: "user", content: "Hi" }],
       stream: true,
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/event-stream");
@@ -311,7 +360,7 @@ describe("SSE streaming passthrough", () => {
       messages: [{ role: "user", content: "Hi" }],
       stream: true,
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/event-stream");
@@ -335,7 +384,6 @@ describe("SSE streaming passthrough", () => {
     fetchSpy.mockImplementation(async () => {
       callCount++;
       if (callCount === 1) {
-        // First call: return a stream that errors mid-way
         const stream = new ReadableStream({
           start(controller) {
             controller.enqueue(new TextEncoder().encode("data: token1\n\n"));
@@ -347,7 +395,6 @@ describe("SSE streaming passthrough", () => {
           headers: { "Content-Type": "text/event-stream" },
         });
       }
-      // Should not be called
       return new Response("should not reach", { status: 200 });
     });
 
@@ -356,16 +403,13 @@ describe("SSE streaming passthrough", () => {
       messages: [{ role: "user", content: "Hi" }],
       stream: true,
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/event-stream");
 
-    // Reading the stream should throw due to mid-stream error
     const reader = res.body!.getReader();
     await expect(reader.read()).rejects.toThrow();
-
-    // Only one fetch call — no retry after mid-stream error
     expect(fetchSpy).toHaveBeenCalledOnce();
   });
 
@@ -389,13 +433,12 @@ describe("SSE streaming passthrough", () => {
       messages: [{ role: "user", content: "Hi" }],
       stream: true,
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/event-stream");
     expect(fetchSpy).toHaveBeenCalledTimes(2);
 
-    // First call to openai, second to deepseek
     const firstReq = fetchSpy.mock.calls[0][0] as Request;
     expect(firstReq.url).toBe("https://api.openai.com/v1/chat/completions");
     const secondReq = fetchSpy.mock.calls[1][0] as Request;
@@ -417,7 +460,7 @@ describe("SSE streaming passthrough", () => {
       messages: [{ role: "user", content: "Hi" }],
       stream: true,
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(200);
     expect(fetchSpy).toHaveBeenCalledTimes(2);
@@ -443,7 +486,7 @@ describe("SSE streaming passthrough", () => {
       messages: [{ role: "user", content: "Hi" }],
       stream: true,
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(503);
     const body = await res.json();
@@ -463,7 +506,7 @@ describe("SSE streaming passthrough", () => {
       messages: [{ role: "user", content: "Hi" }],
       stream: false,
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/json");
@@ -490,11 +533,306 @@ describe("SSE streaming passthrough", () => {
       model: "o1",
       messages: [{ role: "user", content: "Hi" }],
     });
-    const res = await handleChatCompletions(req, modelIndex);
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
 
     expect(res.status).toBe(200);
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     const body = await res.json();
     expect(body).toEqual(upstreamResponse);
+  });
+});
+
+describe("Sticky key selection", () => {
+  it("uses activeKeyIndex from config to select API key", async () => {
+    const kvConfigs = new Map([
+      ["openai", { ...openaiConfig, activeKeyIndex: 1 }],
+      ["deepseek", { ...deepseekConfig }],
+    ]);
+    const kvModelIndex = buildModelIndex(kvConfigs);
+    const storage = mockStorage({
+      openai: { ...openaiConfig, activeKeyIndex: 1 },
+    });
+    const req = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    await handleChatCompletions(req, kvModelIndex, storage);
+
+    const upstreamReq = fetchSpy.mock.calls[0][0] as Request;
+    expect(upstreamReq.headers.get("Authorization")).toBe("Bearer sk-openai-2");
+  });
+
+  it("uses same key across multiple requests until failure", async () => {
+    const storage = mockStorage({
+      openai: { ...openaiConfig, activeKeyIndex: 0 },
+    });
+
+    fetchSpy.mockImplementation(() =>
+      Promise.resolve(new Response(JSON.stringify(upstreamResponse), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })),
+    );
+
+    const req1 = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const req2 = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const req3 = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+
+    await handleChatCompletions(req1, modelIndex, storage);
+    await handleChatCompletions(req2, modelIndex, storage);
+    await handleChatCompletions(req3, modelIndex, storage);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    for (const call of fetchSpy.mock.calls) {
+      const upstreamReq = call[0] as Request;
+      expect(upstreamReq.headers.get("Authorization")).toBe("Bearer sk-openai-1");
+    }
+  });
+});
+
+describe("429 key rotation", () => {
+  it("rotates to next key on 429 and retries", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          { status: 429, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(upstreamResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    const storage = mockStorage({
+      openai: { ...openaiConfig, activeKeyIndex: 0 },
+    });
+
+    const req = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, storage);
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    const firstReq = fetchSpy.mock.calls[0][0] as Request;
+    expect(firstReq.headers.get("Authorization")).toBe("Bearer sk-openai-1");
+
+    const secondReq = fetchSpy.mock.calls[1][0] as Request;
+    expect(secondReq.headers.get("Authorization")).toBe("Bearer sk-openai-2");
+  });
+
+  it("rotates immediately on 429 without delay", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "30",
+            },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(upstreamResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    const storage = mockStorage({
+      openai: { ...openaiConfig, activeKeyIndex: 0 },
+    });
+
+    const req = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    await handleChatCompletions(req, modelIndex, storage);
+
+    expect(delaySpy).not.toHaveBeenCalled();
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("updates activeKeyIndex in storage after rotation", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          { status: 429, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(upstreamResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    const storage = mockStorage({
+      openai: { ...openaiConfig, activeKeyIndex: 0 },
+    });
+
+    const req = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    await handleChatCompletions(req, modelIndex, storage);
+
+    const storedKeys = await storage.getKeys("openai");
+    expect(storedKeys?.activeKeyIndex).toBe(1);
+  });
+
+  it("returns 429 in OpenAI error format when all keys exhausted", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "45",
+            },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "30",
+            },
+          },
+        ),
+      );
+
+    const storage = mockStorage({
+      openai: { ...openaiConfig, activeKeyIndex: 0 },
+    });
+
+    const req = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, storage);
+
+    expect(res.status).toBe(429);
+    const body = await res.json();
+    expect(body.error.type).toBe("rate_limit_error");
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(delaySpy).not.toHaveBeenCalled();
+  });
+
+  it("returns 429 when all keys exhausted for single-key provider", async () => {
+    fetchSpy.mockResolvedValue(
+      new Response(
+        JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+        { status: 429, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const storage = mockStorage({
+      deepseek: { ...deepseekConfig, activeKeyIndex: 0 },
+    });
+
+    const req = makeRequest({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, storage);
+
+    expect(res.status).toBe(429);
+    const body = await res.json();
+    expect(body.error.type).toBe("rate_limit_error");
+    expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+
+  it("falls through to next provider after all keys exhausted", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          { status: 429, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          { status: 429, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(upstreamResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    const storage = mockStorage({
+      openai: { ...openaiConfig, activeKeyIndex: 0 },
+      deepseek: { ...deepseekConfig, activeKeyIndex: 0 },
+    });
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, storage);
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+
+    const thirdReq = fetchSpy.mock.calls[2][0] as Request;
+    expect(thirdReq.url).toBe("https://api.deepseek.com/v1/chat/completions");
+  });
+
+  it("streams on 429 from upstream before tokens are sent", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          { status: 429, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          "data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+          { status: 200, headers: { "Content-Type": "text/event-stream" } },
+        ),
+      );
+
+    const storage = mockStorage({
+      openai: { ...openaiConfig, activeKeyIndex: 0 },
+    });
+
+    const req = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+      stream: true,
+    });
+    const res = await handleChatCompletions(req, modelIndex, storage);
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 });

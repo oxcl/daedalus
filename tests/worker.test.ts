@@ -1,31 +1,40 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import worker from "../src/index";
+import { fetchHandler } from "../src/index";
+import { Storage } from "../src/storage";
+import { ProviderConfig } from "../src/config";
 
-const API_KEY = "test-key";
-const ctx = {} as any;
+function mockStorage(
+  providerConfigs?: Record<string, ProviderConfig>
+): Storage {
+  const configs = new Map<string, ProviderConfig>(
+    providerConfigs ? Object.entries(providerConfigs) : []
+  );
 
-function mockKV(entries: Record<string, unknown>) {
-  const keys = Object.keys(entries).map((name) => ({ name, list: undefined as never }));
   return {
-    list: async ({ prefix }: { prefix: string }) => ({
-      keys: keys.filter((k) => k.name.startsWith(prefix)),
-      list_complete: true,
-      cacheStatus: null,
-    }),
-    get: async (key: string, type?: string) => {
-      if (!(key in entries)) return null;
-      const val = entries[key];
-      if (type === "json") return val;
-      return JSON.stringify(val);
+    async listConfigs() {
+      return new Map(configs);
     },
-  } as unknown as KVNamespace;
+    async getConfig(provider: string) {
+      return configs.get(provider) || null;
+    },
+    async putConfig(provider: string, config: ProviderConfig) {
+      configs.set(provider, config);
+    },
+    async getKeys() {
+      return null;
+    },
+    async putKeys() {},
+  };
 }
 
-const providerConfigs = {
-  "provider:openai": {
+const providerConfigs: Record<string, ProviderConfig> = {
+  "openai": {
     apiKeys: ["sk-openai-1"],
     baseUrl: "https://api.openai.com/v1",
-    models: ["gpt-4o", { name: "o1", providerName: "o1-2024-12-17" }],
+    models: [
+      { name: "gpt-4o", providerName: "gpt-4o" },
+      { name: "o1", providerName: "o1-2024-12-17" },
+    ],
     activeKeyIndex: 0,
   },
 };
@@ -56,7 +65,7 @@ beforeEach(() => {
       headers: { "Content-Type": "application/json" },
     }),
   );
-  globalThis.fetch = fetchSpy;
+  globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
 });
 
 afterEach(() => {
@@ -65,20 +74,18 @@ afterEach(() => {
 
 describe("Worker", () => {
   it("returns 200 with status ok for GET /health", async () => {
-    const env = { KV: mockKV({}), GATEWAY_API_KEY: API_KEY } as any;
+    const storage = mockStorage();
     const req = new Request("http://localhost/health");
-    const res = await worker.fetch(req, env, ctx);
+    const res = await fetchHandler(req, storage);
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ status: "ok" });
   });
 
   it("returns 404 with OpenAI-compatible error for unknown paths", async () => {
-    const env = { KV: mockKV({}), GATEWAY_API_KEY: API_KEY } as any;
-    const req = new Request("http://localhost/unknown", {
-      headers: { Authorization: `Bearer ${API_KEY}` },
-    });
-    const res = await worker.fetch(req, env, ctx);
+    const storage = mockStorage();
+    const req = new Request("http://localhost/unknown");
+    const res = await fetchHandler(req, storage);
 
     expect(res.status).toBe(404);
     const body = await res.json();
@@ -88,64 +95,19 @@ describe("Worker", () => {
   });
 
   it("returns correct Content-Type header", async () => {
-    const env = { KV: mockKV({}), GATEWAY_API_KEY: API_KEY } as any;
+    const storage = mockStorage();
     const req = new Request("http://localhost/health");
-    const res = await worker.fetch(req, env, ctx);
+    const res = await fetchHandler(req, storage);
 
     expect(res.headers.get("content-type")).toBe("application/json");
   });
 });
 
-describe("Authentication", () => {
-  it("returns 401 for request without Authorization header", async () => {
-    const env = { KV: mockKV({}), GATEWAY_API_KEY: API_KEY } as any;
-    const req = new Request("http://localhost/v1/chat/completions");
-    const res = await worker.fetch(req, env, ctx);
-
-    expect(res.status).toBe(401);
-    const body = await res.json();
-    expect(body.error).toEqual({
-      message: "Missing Authorization header",
-      type: "invalid_request_error",
-      code: null,
-    });
-  });
-
-  it("returns 401 for request with wrong key", async () => {
-    const env = { KV: mockKV({}), GATEWAY_API_KEY: API_KEY } as any;
-    const req = new Request("http://localhost/v1/chat/completions", {
-      headers: { Authorization: "Bearer wrong-key" },
-    });
-    const res = await worker.fetch(req, env, ctx);
-
-    expect(res.status).toBe(401);
-    const body = await res.json();
-    expect(body.error).toEqual({
-      message: "Invalid API key",
-      type: "invalid_request_error",
-      code: null,
-    });
-  });
-
-  it("does not require auth for /health", async () => {
-    const env = { KV: mockKV({}), GATEWAY_API_KEY: API_KEY } as any;
-    const req = new Request("http://localhost/health");
-    const res = await worker.fetch(req, env, ctx);
-
-    expect(res.status).toBe(200);
-  });
-});
-
 describe("Model List", () => {
   it("returns all models with dual naming from a single provider", async () => {
-    const kv = mockKV({
-      "provider:openai": providerConfigs["provider:openai"],
-    });
-    const env = { KV: kv, GATEWAY_API_KEY: API_KEY } as any;
-    const req = new Request("http://localhost/v1/models", {
-      headers: { Authorization: `Bearer ${API_KEY}` },
-    });
-    const res = await worker.fetch(req, env, ctx);
+    const storage = mockStorage(providerConfigs);
+    const req = new Request("http://localhost/v1/models");
+    const res = await fetchHandler(req, storage);
     const body = await res.json();
 
     expect(res.status).toBe(200);
@@ -159,20 +121,20 @@ describe("Model List", () => {
   });
 
   it("deduplicates generic names with first provider winning", async () => {
-    const kv = mockKV({
-      "provider:openai": providerConfigs["provider:openai"],
-      "provider:deepseek": {
+    const storage = mockStorage({
+      "openai": providerConfigs["openai"],
+      "deepseek": {
         apiKeys: ["sk-ds-1"],
         baseUrl: "https://api.deepseek.com/v1",
-        models: ["deepseek-chat", { name: "o1", providerName: "deepseek-o1" }],
+        models: [
+          { name: "deepseek-chat", providerName: "deepseek-chat" },
+          { name: "o1", providerName: "deepseek-o1" },
+        ],
         activeKeyIndex: 0,
       },
     });
-    const env = { KV: kv, GATEWAY_API_KEY: API_KEY } as any;
-    const req = new Request("http://localhost/v1/models", {
-      headers: { Authorization: `Bearer ${API_KEY}` },
-    });
-    const res = await worker.fetch(req, env, ctx);
+    const req = new Request("http://localhost/v1/models");
+    const res = await fetchHandler(req, storage);
     const body = await res.json();
 
     expect(res.status).toBe(200);
@@ -188,11 +150,9 @@ describe("Model List", () => {
   });
 
   it("returns empty list when no providers configured", async () => {
-    const env = { KV: mockKV({}), GATEWAY_API_KEY: API_KEY } as any;
-    const req = new Request("http://localhost/v1/models", {
-      headers: { Authorization: `Bearer ${API_KEY}` },
-    });
-    const res = await worker.fetch(req, env, ctx);
+    const storage = mockStorage();
+    const req = new Request("http://localhost/v1/models");
+    const res = await fetchHandler(req, storage);
     const body = await res.json();
 
     expect(res.status).toBe(200);
@@ -200,14 +160,9 @@ describe("Model List", () => {
   });
 
   it("returns models regardless of rate limit state", async () => {
-    const kv = mockKV({
-      "provider:openai": providerConfigs["provider:openai"],
-    });
-    const env = { KV: kv, GATEWAY_API_KEY: API_KEY } as any;
-    const req = new Request("http://localhost/v1/models", {
-      headers: { Authorization: `Bearer ${API_KEY}` },
-    });
-    const res = await worker.fetch(req, env, ctx);
+    const storage = mockStorage(providerConfigs);
+    const req = new Request("http://localhost/v1/models");
+    const res = await fetchHandler(req, storage);
     const body = await res.json();
 
     expect(body.data.length).toBeGreaterThan(0);
@@ -216,19 +171,16 @@ describe("Model List", () => {
 
 describe("Chat Completions Proxy", () => {
   it("returns 404 for unknown model", async () => {
-    const env = { KV: mockKV(providerConfigs), GATEWAY_API_KEY: API_KEY } as any;
+    const storage = mockStorage(providerConfigs);
     const req = new Request("http://localhost/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${API_KEY}`,
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "nonexistent",
         messages: [{ role: "user", content: "Hi" }],
       }),
     });
-    const res = await worker.fetch(req, env, ctx);
+    const res = await fetchHandler(req, storage);
 
     expect(res.status).toBe(404);
     const body = await res.json();
@@ -236,18 +188,15 @@ describe("Chat Completions Proxy", () => {
   });
 
   it("returns 400 when model field is missing", async () => {
-    const env = { KV: mockKV(providerConfigs), GATEWAY_API_KEY: API_KEY } as any;
+    const storage = mockStorage(providerConfigs);
     const req = new Request("http://localhost/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${API_KEY}`,
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         messages: [{ role: "user", content: "Hi" }],
       }),
     });
-    const res = await worker.fetch(req, env, ctx);
+    const res = await fetchHandler(req, storage);
 
     expect(res.status).toBe(400);
     const body = await res.json();
@@ -255,19 +204,16 @@ describe("Chat Completions Proxy", () => {
   });
 
   it("proxies request to upstream and returns response", async () => {
-    const env = { KV: mockKV(providerConfigs), GATEWAY_API_KEY: API_KEY } as any;
+    const storage = mockStorage(providerConfigs);
     const req = new Request("http://localhost/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${API_KEY}`,
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "gpt-4o",
         messages: [{ role: "user", content: "Hi" }],
       }),
     });
-    const res = await worker.fetch(req, env, ctx);
+    const res = await fetchHandler(req, storage);
 
     expect(res.status).toBe(200);
     expect(fetchSpy).toHaveBeenCalledOnce();
@@ -276,38 +222,32 @@ describe("Chat Completions Proxy", () => {
   });
 
   it("injects provider API key upstream", async () => {
-    const env = { KV: mockKV(providerConfigs), GATEWAY_API_KEY: API_KEY } as any;
+    const storage = mockStorage(providerConfigs);
     const req = new Request("http://localhost/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${API_KEY}`,
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "gpt-4o",
         messages: [{ role: "user", content: "Hi" }],
       }),
     });
-    await worker.fetch(req, env, ctx);
+    await fetchHandler(req, storage);
 
     const upstreamReq = fetchSpy.mock.calls[0][0] as Request;
     expect(upstreamReq.headers.get("Authorization")).toBe("Bearer sk-openai-1");
   });
 
   it("resolves prefixed model name", async () => {
-    const env = { KV: mockKV(providerConfigs), GATEWAY_API_KEY: API_KEY } as any;
+    const storage = mockStorage(providerConfigs);
     const req = new Request("http://localhost/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${API_KEY}`,
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "openai@o1",
         messages: [{ role: "user", content: "Hi" }],
       }),
     });
-    await worker.fetch(req, env, ctx);
+    await fetchHandler(req, storage);
 
     const upstreamReq = fetchSpy.mock.calls[0][0] as Request;
     const upstreamBody = await upstreamReq.json();
@@ -315,11 +255,9 @@ describe("Chat Completions Proxy", () => {
   });
 
   it("rejects GET requests to /v1/chat/completions", async () => {
-    const env = { KV: mockKV(providerConfigs), GATEWAY_API_KEY: API_KEY } as any;
-    const req = new Request("http://localhost/v1/chat/completions", {
-      headers: { Authorization: `Bearer ${API_KEY}` },
-    });
-    const res = await worker.fetch(req, env, ctx);
+    const storage = mockStorage(providerConfigs);
+    const req = new Request("http://localhost/v1/chat/completions");
+    const res = await fetchHandler(req, storage);
 
     expect(res.status).toBe(404);
   });
