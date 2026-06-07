@@ -42,11 +42,13 @@ export default {
     if (path === "/v1/models" && request.method === "GET") {
       const configs = await loadConfigs(env.KV);
       const data: { id: string; object: string; owned_by: string }[] = [];
+      const seenGeneric = new Set<string>();
       for (const [provider, config] of configs) {
         for (const model of config.models) {
-          data.push({ id: model.name, object: "model", owned_by: provider });
-          if (model.name !== model.providerName) {
-            data.push({ id: `${provider}@${model.name}`, object: "model", owned_by: provider });
+          data.push({ id: `${provider}@${model.name}`, object: "model", owned_by: provider });
+          if (!seenGeneric.has(model.name)) {
+            seenGeneric.add(model.name);
+            data.push({ id: model.name, object: "model", owned_by: provider });
           }
         }
       }

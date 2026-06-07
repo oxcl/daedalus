@@ -136,6 +136,84 @@ describe("Authentication", () => {
   });
 });
 
+describe("Model List", () => {
+  it("returns all models with dual naming from a single provider", async () => {
+    const kv = mockKV({
+      "provider:openai": providerConfigs["provider:openai"],
+    });
+    const env = { KV: kv, GATEWAY_API_KEY: API_KEY } as any;
+    const req = new Request("http://localhost/v1/models", {
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+    const res = await worker.fetch(req, env, ctx);
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.object).toBe("list");
+    expect(body.data).toEqual([
+      { id: "openai@gpt-4o", object: "model", owned_by: "openai" },
+      { id: "gpt-4o", object: "model", owned_by: "openai" },
+      { id: "openai@o1", object: "model", owned_by: "openai" },
+      { id: "o1", object: "model", owned_by: "openai" },
+    ]);
+  });
+
+  it("deduplicates generic names with first provider winning", async () => {
+    const kv = mockKV({
+      "provider:openai": providerConfigs["provider:openai"],
+      "provider:deepseek": {
+        apiKeys: ["sk-ds-1"],
+        baseUrl: "https://api.deepseek.com/v1",
+        models: ["deepseek-chat", { name: "o1", providerName: "deepseek-o1" }],
+        activeKeyIndex: 0,
+      },
+    });
+    const env = { KV: kv, GATEWAY_API_KEY: API_KEY } as any;
+    const req = new Request("http://localhost/v1/models", {
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+    const res = await worker.fetch(req, env, ctx);
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.data).toEqual([
+      { id: "openai@gpt-4o", object: "model", owned_by: "openai" },
+      { id: "gpt-4o", object: "model", owned_by: "openai" },
+      { id: "openai@o1", object: "model", owned_by: "openai" },
+      { id: "o1", object: "model", owned_by: "openai" },
+      { id: "deepseek@deepseek-chat", object: "model", owned_by: "deepseek" },
+      { id: "deepseek-chat", object: "model", owned_by: "deepseek" },
+      { id: "deepseek@o1", object: "model", owned_by: "deepseek" },
+    ]);
+  });
+
+  it("returns empty list when no providers configured", async () => {
+    const env = { KV: mockKV({}), GATEWAY_API_KEY: API_KEY } as any;
+    const req = new Request("http://localhost/v1/models", {
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+    const res = await worker.fetch(req, env, ctx);
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body).toEqual({ object: "list", data: [] });
+  });
+
+  it("returns models regardless of rate limit state", async () => {
+    const kv = mockKV({
+      "provider:openai": providerConfigs["provider:openai"],
+    });
+    const env = { KV: kv, GATEWAY_API_KEY: API_KEY } as any;
+    const req = new Request("http://localhost/v1/models", {
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+    const res = await worker.fetch(req, env, ctx);
+    const body = await res.json();
+
+    expect(body.data.length).toBeGreaterThan(0);
+  });
+});
+
 describe("Chat Completions Proxy", () => {
   it("returns 404 for unknown model", async () => {
     const env = { KV: mockKV(providerConfigs), GATEWAY_API_KEY: API_KEY } as any;
