@@ -177,6 +177,9 @@ export async function handleChatCompletions(
 
   const isStreaming = body.stream === true;
 
+  let lastError: Response | undefined;
+  let lastRetryAfter: number | undefined;
+
   for (let i = 0; i < resolutions.length; i++) {
     const resolution = resolutions[i];
     const providerConfig = { ...resolution.providerConfig };
@@ -196,16 +199,22 @@ export async function handleChatCompletions(
       return response;
     }
 
-    if (i === resolutions.length - 1) {
-      if (providerConfig.activeKeyIndex !== resolution.providerConfig.activeKeyIndex) {
-        await updateActiveKeyIndex(storage, resolution.provider, providerConfig.activeKeyIndex);
-      }
-      if (response.status === 429) {
-        return openaiRateLimitError("All providers rate-limited", parseRetryAfter(response.headers.get("Retry-After")));
-      }
-      return response;
+    if (providerConfig.activeKeyIndex !== resolution.providerConfig.activeKeyIndex) {
+      await updateActiveKeyIndex(storage, resolution.provider, providerConfig.activeKeyIndex);
+    }
+
+    lastError = response;
+    if (response.status === 429) {
+      lastRetryAfter = parseRetryAfter(response.headers.get("Retry-After"));
+    }
+
+    if (response.status !== 429) {
+      continue;
     }
   }
 
-  return openaiError("No providers available", 502);
+  if (lastError?.status === 429) {
+    return openaiRateLimitError("All providers rate-limited", lastRetryAfter);
+  }
+  return lastError ?? openaiError("No providers available", 502);
 }

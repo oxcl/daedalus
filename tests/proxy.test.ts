@@ -893,3 +893,235 @@ describe("429 key rotation", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("Non-429 error retry across providers", () => {
+  it("retries with next provider on 500 error and succeeds", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Internal server error", type: "server_error" } }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(upstreamResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    const body = await res.json();
+    expect(body).toEqual(upstreamResponse);
+  });
+
+  it("retries with next provider on 502 error and succeeds", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Bad gateway", type: "server_error" } }),
+          { status: 502, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(upstreamResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries with next provider on 400 error and succeeds", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Bad request", type: "invalid_request_error" } }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(upstreamResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns last error when all providers fail with non-429 errors", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "OpenAI overloaded", type: "server_error" } }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "DeepSeek overloaded", type: "server_error" } }),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
+
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.error.message).toBe("DeepSeek overloaded");
+    expect(body.error.type).toBe("server_error");
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves error status code and message from last provider", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "First provider error", type: "server_error" } }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Second provider error", type: "server_error" } }),
+          { status: 502, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
+
+    expect(res.status).toBe(502);
+    const body = await res.json();
+    expect(body.error.message).toBe("Second provider error");
+  });
+
+  it("does not retry on 429 - follows separate rotation logic", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          { status: 429, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(upstreamResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    const storage = mockStorage({
+      openai: { ...openaiConfig, activeKeyIndex: 0 },
+    });
+
+    const req = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, storage);
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    const secondReq = fetchSpy.mock.calls[1][0] as Request;
+    expect(secondReq.headers.get("Authorization")).toBe("Bearer sk-openai-2");
+  });
+
+  it("retries on connection error with next provider", async () => {
+    fetchSpy
+      .mockRejectedValueOnce(new Error("ECONNREFUSED"))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(upstreamResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns error when single provider fails with non-429 error", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ error: { message: "Bad request", type: "invalid_request_error" } }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const req = makeRequest({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.message).toBe("Bad request");
+    expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+
+  it("skips providers already attempted", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Server error", type: "server_error" } }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Server error", type: "server_error" } }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
+
+    expect(res.status).toBe(500);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    const firstReq = fetchSpy.mock.calls[0][0] as Request;
+    const secondReq = fetchSpy.mock.calls[1][0] as Request;
+    expect(firstReq.url).not.toBe(secondReq.url);
+  });
+});
