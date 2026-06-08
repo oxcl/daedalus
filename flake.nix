@@ -141,8 +141,6 @@
       homeManagerModules.default = { config, lib, pkgs, ... }:
         let
           cfg = config.services.daedalus;
-          xdgConfig = "${config.xdg.configHome}/daedalus";
-          xdgData = "${config.xdg.dataHome}/daedalus";
         in
         {
           options.services.daedalus = {
@@ -162,9 +160,6 @@
           config = lib.mkIf cfg.enable {
             home.packages = [ cfg.package ];
 
-            xdg.configFile."daedalus/providers.json".text =
-              builtins.toJSON { };
-
             systemd.user.services.daedalus = {
               Unit = {
                 Description = "Daedalus AI Gateway";
@@ -175,8 +170,6 @@
                 ExecStart = "${cfg.package}/bin/daedalus";
                 Environment = [
                   "PORT=${toString cfg.port}"
-                  "XDG_CONFIG_HOME=${xdgConfig}"
-                  "XDG_DATA_HOME=${xdgData}"
                 ];
                 Restart = "on-failure";
                 RestartSec = 5;
@@ -187,10 +180,6 @@
                 WantedBy = [ "default.target" ];
               };
             };
-
-            systemd.user.tmpfiles.rules = [
-              "d ${xdgData} 0700 - - - -"
-            ];
           };
         };
     };
