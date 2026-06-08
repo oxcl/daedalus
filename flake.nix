@@ -10,34 +10,49 @@
       supportedSystems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
 
-      daedalusPackage = pkgs: pkgs.stdenv.mkDerivation {
-        pname = "daedalus";
-        version = "0.1.0";
-        src = ./.;
+      daedalusPackage = pkgs:
+        let
+          nodeModules = pkgs.stdenv.mkDerivation {
+            name = "daedalus-node-modules";
+            src = ./.;
+            nativeBuildInputs = [ pkgs.bun ];
+            installPhase = ''
+              export HOME=$TMPHOME
+              bun install --frozen-lockfile
+              cp -r node_modules $out
+            '';
+            outputHashAlgo = "sha256";
+            outputHashMode = "recursive";
+            outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+          };
+        in
+        pkgs.stdenv.mkDerivation {
+          pname = "daedalus";
+          version = "0.1.0";
+          src = ./.;
+          nativeBuildInputs = [ pkgs.bun ];
 
-        buildInputs = [ pkgs.bun ];
+          buildPhase = ''
+            export HOME=$TMPHOME
+            cp -r ${nodeModules} node_modules
+            bun run typecheck
+          '';
 
-        buildPhase = ''
-          export HOME=$TMPHOME
-          bun install --frozen-lockfile
-          bun run typecheck
-        '';
+          installPhase = ''
+            mkdir -p $out/share/daedalus
+            cp -r src $out/share/daedalus/
+            cp -r package.json $out/share/daedalus/
+            cp -r node_modules $out/share/daedalus/
+            cp bun.lock $out/share/daedalus/
 
-        installPhase = ''
-          mkdir -p $out/share/daedalus
-          cp -r src $out/share/daedalus/
-          cp -r package.json $out/share/daedalus/
-          cp -r node_modules $out/share/daedalus/
-          cp bun.lock $out/share/daedalus/
-
-          mkdir -p $out/bin
-          cat > $out/bin/daedalus << wrapper
-          #!/bin/sh
-          exec ${pkgs.bun}/bin/bun run $out/share/daedalus/src/server.ts
-          wrapper
-          chmod +x $out/bin/daedalus
-        '';
-      };
+            mkdir -p $out/bin
+            cat > $out/bin/daedalus << wrapper
+            #!/bin/sh
+            exec ${pkgs.bun}/bin/bun run $out/share/daedalus/src/server.ts
+            wrapper
+            chmod +x $out/bin/daedalus
+          '';
+        };
 
       daemonUser = "daedalus";
       daemonGroup = "daedalus";
