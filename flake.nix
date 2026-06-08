@@ -15,8 +15,8 @@
           nodeModules = pkgs.stdenv.mkDerivation {
             name = "daedalus-node-modules";
             src = ./.;
-            nativeBuildInputs = [ pkgs.bun ];
-            installPhase = ''
+          nativeBuildInputs = [ pkgs.bun pkgs.nodejs ];
+          installPhase = ''
               export HOME=$TMPHOME
               bun install --frozen-lockfile
               cp -r node_modules $out
@@ -30,12 +30,13 @@
           pname = "daedalus";
           version = "0.1.0";
           src = ./.;
-          nativeBuildInputs = [ pkgs.bun ];
+          nativeBuildInputs = [ pkgs.bun pkgs.nodejs ];
 
           buildPhase = ''
             export HOME=$TMPHOME
             cp -r ${nodeModules} node_modules
-            bun run typecheck
+            patchShebangs node_modules
+            node_modules/.bin/tsc --noEmit
           '';
 
           installPhase = ''
