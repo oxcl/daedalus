@@ -767,6 +767,63 @@ describe("429 key rotation", () => {
     expect(fetchSpy).toHaveBeenCalledOnce();
   });
 
+  it("returns 429 with all-providers message when all providers exhausted", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "45",
+            },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "60",
+            },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { message: "Rate limited", type: "rate_limit_error" } }),
+          {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "30",
+            },
+          },
+        ),
+      );
+
+    const storage = mockStorage({
+      openai: { ...openaiConfig, activeKeyIndex: 0 },
+      deepseek: { ...deepseekConfig, activeKeyIndex: 0 },
+    });
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+    const res = await handleChatCompletions(req, modelIndex, storage);
+
+    expect(res.status).toBe(429);
+    const body = await res.json();
+    expect(body.error.type).toBe("rate_limit_error");
+    expect(body.error.message).toBe("All providers rate-limited");
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+  });
+
   it("falls through to next provider after all keys exhausted", async () => {
     fetchSpy
       .mockResolvedValueOnce(

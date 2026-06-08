@@ -31,7 +31,8 @@ export function buildUpstreamRequest(
 ): Request {
   const upstreamUrl = `${url.replace(/\/+$/, "")}/chat/completions`;
   const apiKey = providerConfig.apiKeys[providerConfig.activeKeyIndex];
-  const upstreamBody = { ...body, model: providerModelName };
+  const { store, ...rest } = body;
+  const upstreamBody = { ...rest, model: providerModelName };
 
   return new Request(upstreamUrl, {
     method: "POST",
@@ -198,6 +199,9 @@ export async function handleChatCompletions(
     if (i === resolutions.length - 1) {
       if (providerConfig.activeKeyIndex !== resolution.providerConfig.activeKeyIndex) {
         await updateActiveKeyIndex(storage, resolution.provider, providerConfig.activeKeyIndex);
+      }
+      if (response.status === 429) {
+        return openaiRateLimitError("All providers rate-limited", parseRetryAfter(response.headers.get("Retry-After")));
       }
       return response;
     }
