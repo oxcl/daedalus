@@ -23,7 +23,7 @@
             '';
             outputHashAlgo = "sha256";
             outputHashMode = "recursive";
-            outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+            outputHash = "sha256-mwxcikVE2HM555/KNyWCUkUxWEOO8vVsye1fO6/1Ufg=";
           };
         in
         pkgs.stdenv.mkDerivation {
