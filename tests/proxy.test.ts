@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { buildModelIndex, ProviderConfig } from "../src/config";
-import { handleChatCompletions, setDelayFn, resetDelayFn } from "../src/proxy";
+import { handleChatCompletions, setDelayFn, resetDelayFn, setTimerFn, resetTimerFn, IDLE_TIMEOUT_MS } from "../src/proxy";
 import { Storage } from "../src/storage";
 
 function mockStorage(
@@ -95,6 +95,7 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = originalFetch;
   resetDelayFn();
+  resetTimerFn();
   vi.restoreAllMocks();
 });
 
@@ -1123,5 +1124,212 @@ describe("Non-429 error retry across providers", () => {
     const firstReq = fetchSpy.mock.calls[0][0] as Request;
     const secondReq = fetchSpy.mock.calls[1][0] as Request;
     expect(firstReq.url).not.toBe(secondReq.url);
+  });
+});
+
+describe("Idle timeout", () => {
+  let timers: Map<number, () => void>;
+  let nextTimerId: number;
+  let timerFnSpy: ReturnType<typeof vi.fn>;
+  let clearFnSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    timers = new Map();
+    nextTimerId = 1;
+
+    timerFnSpy = vi.fn((fn: () => void) => {
+      const id = nextTimerId++;
+      timers.set(id, fn);
+      return id as unknown as ReturnType<typeof setTimeout>;
+    });
+
+    clearFnSpy = vi.fn((id: unknown) => {
+      timers.delete(id as number);
+    });
+
+    setTimerFn(
+      timerFnSpy as unknown as (callback: () => void, ms: number) => ReturnType<typeof setTimeout>,
+      clearFnSpy as unknown as (id: ReturnType<typeof setTimeout>) => void,
+    );
+  });
+
+  afterEach(() => {
+    resetTimerFn();
+    timers.clear();
+    vi.restoreAllMocks();
+  });
+
+  function fireAllTimers(): void {
+    for (const [id, fn] of [...timers]) {
+      timers.delete(id);
+      fn();
+    }
+  }
+
+  it("aborts non-streaming request after idle timeout and retries next provider", async () => {
+    const signals: AbortSignal[] = [];
+    let callCount = 0;
+    fetchSpy.mockImplementation(async (_req: Request, init?: RequestInit) => {
+      const signal = init?.signal as AbortSignal;
+      signals.push(signal);
+      callCount++;
+      if (callCount === 1) {
+        return new Promise((_, reject) => {
+          signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        });
+      }
+      return new Response(JSON.stringify(upstreamResponse), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+
+    const promise = handleChatCompletions(req, modelIndex, makeStorage());
+    await new Promise((r) => setTimeout(r, 0));
+
+    fireAllTimers();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(signals[0]?.aborted).toBe(true);
+    const res = await promise;
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    const secondReq = fetchSpy.mock.calls[1][0] as Request;
+    expect(secondReq.url).toBe("https://api.deepseek.com/v1/chat/completions");
+  });
+
+  it("streaming: fires idle timeout when no chunks arrive", async () => {
+    const hangingStream = new ReadableStream({
+      start() {
+        // never enqueue — simulates hung provider
+      },
+    });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(hangingStream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    );
+
+    const req = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+      stream: true,
+    });
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
+    expect(res.status).toBe(200);
+
+    const reader = res.body!.getReader();
+    const readPromise = reader.read();
+    await new Promise((r) => setTimeout(r, 0));
+
+    fireAllTimers();
+    await expect(readPromise).rejects.toThrow();
+  });
+
+  it("streaming: resets timeout on each chunk received", async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("data: token1\n\n"));
+        controller.enqueue(new TextEncoder().encode("data: token2\n\n"));
+        controller.enqueue(new TextEncoder().encode("data: token3\n\n"));
+        controller.close();
+      },
+    });
+
+    fetchSpy.mockResolvedValueOnce(
+      new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    );
+
+    const req = makeRequest({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Hi" }],
+      stream: true,
+    });
+    const res = await handleChatCompletions(req, modelIndex, makeStorage());
+    const reader = res.body!.getReader();
+
+    const chunk1 = await reader.read();
+    expect(chunk1.done).toBe(false);
+    expect(new TextDecoder().decode(chunk1.value)).toBe("data: token1\n\n");
+
+    const chunk2 = await reader.read();
+    expect(chunk2.done).toBe(false);
+
+    const chunk3 = await reader.read();
+    expect(chunk3.done).toBe(false);
+
+    const done = await reader.read();
+    expect(done.done).toBe(true);
+  });
+
+  it("returns last error when all providers timeout (non-streaming)", async () => {
+    fetchSpy.mockImplementation(async (_req: Request, init?: RequestInit) => {
+      return new Promise((_, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    });
+
+    const req = makeRequest({
+      model: "o1",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+
+    const promise = handleChatCompletions(req, modelIndex, makeStorage());
+    await new Promise((r) => setTimeout(r, 0));
+
+    fireAllTimers();
+    await new Promise((r) => setTimeout(r, 0));
+    fireAllTimers();
+    await new Promise((r) => setTimeout(r, 0));
+
+    const res = await promise;
+
+    expect(res.status).toBe(502);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns 502 in OpenAI error format when single provider times out", async () => {
+    fetchSpy.mockImplementation(async (_req: Request, init?: RequestInit) => {
+      return new Promise((_, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    });
+
+    const req = makeRequest({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: "Hi" }],
+    });
+
+    const promise = handleChatCompletions(req, modelIndex, makeStorage());
+    await new Promise((r) => setTimeout(r, 0));
+
+    fireAllTimers();
+    await new Promise((r) => setTimeout(r, 0));
+
+    const res = await promise;
+
+    expect(res.status).toBe(502);
+    const body = await res.json();
+    expect(body).toHaveProperty("error");
+    expect(body.error.type).toBe("invalid_request_error");
+    expect(fetchSpy).toHaveBeenCalledOnce();
   });
 });

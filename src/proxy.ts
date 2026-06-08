@@ -1,6 +1,24 @@
 import { type ModelIndex, type ProviderConfig, ModelNotFoundError, updateActiveKeyIndex } from "./config";
 import { type Storage } from "./storage";
 
+export const IDLE_TIMEOUT_MS = 10_000;
+
+let _setTimeout: (callback: () => void, ms: number) => ReturnType<typeof setTimeout> = (cb, ms) => globalThis.setTimeout(cb, ms);
+let _clearTimeout: (id: ReturnType<typeof setTimeout>) => void = (id) => globalThis.clearTimeout(id);
+
+export function setTimerFn(
+  setTimeoutFn: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>,
+  clearTimeoutFn: (id: ReturnType<typeof setTimeout>) => void,
+): void {
+  _setTimeout = setTimeoutFn;
+  _clearTimeout = clearTimeoutFn;
+}
+
+export function resetTimerFn(): void {
+  _setTimeout = (cb, ms) => globalThis.setTimeout(cb, ms);
+  _clearTimeout = (id) => globalThis.clearTimeout(id);
+}
+
 function openaiError(message: string, status: number): Response {
   return new Response(
     JSON.stringify({
@@ -66,6 +84,52 @@ export function resetDelayFn(): void {
   _delayFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function wrapWithIdleTimeout(
+  body: ReadableStream<Uint8Array>,
+  timeoutMs: number,
+): ReadableStream<Uint8Array> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  function resetTimer(
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+  ): void {
+    if (timer !== null) _clearTimeout(timer);
+    timer = _setTimeout(() => {
+      reader.cancel().catch(() => {});
+      controller.error(new Error("Idle timeout: no bytes received for 10 seconds"));
+    }, timeoutMs);
+  }
+
+  return new ReadableStream({
+    start(controller) {
+      const reader = body.getReader();
+      resetTimer(controller, reader);
+
+      (async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              if (timer !== null) _clearTimeout(timer);
+              controller.close();
+              break;
+            }
+            resetTimer(controller, reader);
+            controller.enqueue(value);
+          }
+        } catch (err) {
+          if (timer !== null) _clearTimeout(timer);
+          controller.error(err);
+        }
+      })();
+    },
+    cancel() {
+      if (timer !== null) _clearTimeout(timer);
+    },
+  });
+}
+
 async function tryProvider(
   upstreamRequest: Request,
   isStreaming: boolean,
@@ -73,12 +137,17 @@ async function tryProvider(
   | { ok: true; response: Response }
   | { ok: false; error?: Response; retryAfter?: number }
 > {
+  const controller = new AbortController();
+  const timeout = _setTimeout(() => controller.abort(), IDLE_TIMEOUT_MS);
+
   let response: Response;
   try {
-    response = await fetch(upstreamRequest);
+    response = await fetch(upstreamRequest, { signal: controller.signal });
   } catch {
+    _clearTimeout(timeout);
     return { ok: false, error: openaiError("Upstream connection failed", 502) };
   }
+  _clearTimeout(timeout);
 
   const retryAfter = parseRetryAfter(response.headers.get("Retry-After"));
 
@@ -108,7 +177,15 @@ async function tryProvider(
   }
 
   if (response.ok) {
-    return { ok: true, response };
+    const wrappedBody = wrapWithIdleTimeout(response.body!, IDLE_TIMEOUT_MS);
+    return {
+      ok: true,
+      response: new Response(wrappedBody, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      }),
+    };
   }
   if (response.status === 429) {
     return { ok: false, error: response, retryAfter };
