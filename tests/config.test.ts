@@ -31,9 +31,107 @@ function mockStorage(
   };
 }
 
+function mockStorageWithRaw(
+  entries?: Record<string, Record<string, unknown>>
+): Storage {
+  const configs = new Map<string, ProviderConfig>();
+  if (entries) {
+    for (const [provider, raw] of Object.entries(entries)) {
+      try {
+        const parsed = parseProviderConfigRaw(raw);
+        configs.set(provider, parsed);
+      } catch {
+      }
+    }
+  }
+
+  return {
+    async listConfigs() {
+      return new Map(configs);
+    },
+    async getConfig(provider: string) {
+      return configs.get(provider) || null;
+    },
+    async putConfig(provider: string, config: ProviderConfig) {
+      configs.set(provider, config);
+    },
+    async getKeys() {
+      return null;
+    },
+    async putKeys() {},
+  };
+}
+
+function parseProviderConfigRaw(raw: Record<string, unknown>): ProviderConfig {
+  const config = raw as Record<string, unknown>;
+
+  if (!config || typeof config !== "object") {
+    throw new Error("Invalid provider config: not an object");
+  }
+
+  if (!Array.isArray(config.models)) {
+    throw new Error("Invalid provider config: models must be an array");
+  }
+
+  const baseUrlIsObject = typeof config.baseUrl === "object" && config.baseUrl !== null && !Array.isArray(config.baseUrl);
+  const apiKeysIsObject = typeof config.apiKeys === "object" && config.apiKeys !== null && !Array.isArray(config.apiKeys);
+
+  if (baseUrlIsObject !== apiKeysIsObject) {
+    throw new Error("Invalid provider config: baseUrl and apiKeys must both be simple (string/array) or both be objects");
+  }
+
+  let baseUrls: string[];
+  let apiKeys: string[];
+
+  if (baseUrlIsObject) {
+    const baseUrlObj = config.baseUrl as Record<string, string>;
+    const apiKeysObj = config.apiKeys as Record<string, string[]>;
+    const ids = Object.keys(baseUrlObj).sort();
+    baseUrls = ids.map((id) => {
+      const url = baseUrlObj[id];
+      if (typeof url !== "string" || url.length === 0) {
+        throw new Error(`Invalid provider config: baseUrl["${id}"] must be a non-empty string`);
+      }
+      return url;
+    });
+    apiKeys = [];
+    for (const id of ids) {
+      const keys = apiKeysObj[id];
+      if (!Array.isArray(keys) || keys.length === 0) {
+        throw new Error(`Invalid provider config: apiKeys["${id}"] must be a non-empty array`);
+      }
+      apiKeys.push(...keys);
+    }
+  } else {
+    if (typeof config.baseUrl !== "string" || config.baseUrl.length === 0) {
+      throw new Error("Invalid provider config: baseUrl must be a non-empty string");
+    }
+    if (!Array.isArray(config.apiKeys) || config.apiKeys.length === 0) {
+      throw new Error("Invalid provider config: apiKeys must be a non-empty array");
+    }
+    baseUrls = [config.baseUrl as string];
+    apiKeys = config.apiKeys as string[];
+  }
+
+  const activeKeyIndex =
+    typeof config.activeKeyIndex === "number" ? config.activeKeyIndex : 0;
+
+  return {
+    apiKeys,
+    baseUrls,
+    models: (config.models as (string | { name: string; providerName: string })[]).map((entry) => {
+      if (typeof entry === "string") {
+        return { name: entry, providerName: entry };
+      }
+      return { name: entry.name, providerName: entry.providerName };
+    }),
+    activeKeyIndex,
+  };
+}
+
 const openaiConfig: ProviderConfig = {
   apiKeys: ["sk-openai-1", "sk-openai-2"],
-  baseUrl: "https://api.openai.com/v1",
+  baseUrls: ["https://api.openai.com/v1"],
   models: [
     { name: "gpt-4o", providerName: "gpt-4o" },
     { name: "o1", providerName: "o1-2024-12-17" },
@@ -43,7 +141,7 @@ const openaiConfig: ProviderConfig = {
 
 const deepseekConfig: ProviderConfig = {
   apiKeys: ["sk-ds-1"],
-  baseUrl: "https://api.deepseek.com/v1",
+  baseUrls: ["https://api.deepseek.com/v1"],
   models: [
     { name: "deepseek-chat", providerName: "deepseek-chat" },
     { name: "o1", providerName: "deepseek-o1" },
@@ -76,7 +174,7 @@ describe("parseProviderConfig", () => {
     const storage = mockStorage({
       test: {
         apiKeys: ["key1"],
-        baseUrl: "https://api.test.com/v1",
+        baseUrls: ["https://api.test.com/v1"],
         models: [
           { name: "model-a", providerName: "model-a" },
           { name: "model-b", providerName: "model-b" },
@@ -97,7 +195,7 @@ describe("parseProviderConfig", () => {
     const storage = mockStorage({
       test: {
         apiKeys: ["key1"],
-        baseUrl: "https://api.test.com/v1",
+        baseUrls: ["https://api.test.com/v1"],
         models: [{ name: "gpt-4o", providerName: "gpt-4o-2024-08-06" }],
         activeKeyIndex: 0,
       },
@@ -114,7 +212,7 @@ describe("parseProviderConfig", () => {
     const storage = mockStorage({
       test: {
         apiKeys: ["key1"],
-        baseUrl: "https://api.test.com/v1",
+        baseUrls: ["https://api.test.com/v1"],
         models: [
           { name: "gpt-4o", providerName: "gpt-4o" },
           { name: "o1", providerName: "o1-2024-12-17" },
@@ -137,7 +235,7 @@ describe("parseProviderConfig", () => {
     const storage = mockStorage({
       test: {
         apiKeys: ["key1"],
-        baseUrl: "https://api.test.com/v1",
+        baseUrls: ["https://api.test.com/v1"],
         models: [],
         activeKeyIndex: 0,
       },
@@ -146,6 +244,53 @@ describe("parseProviderConfig", () => {
     const configs = await loadConfigs(storage);
     const config = configs.get("test")!;
     expect(config.activeKeyIndex).toBe(0);
+  });
+
+  it("parses object-format baseUrl and apiKeys", async () => {
+    const storage = mockStorageWithRaw({
+      test: {
+        apiKeys: { a: ["key-a1"], b: ["key-b1", "key-b2"] },
+        baseUrl: { a: "https://a.example.com/v1", b: "https://b.example.com/v1" },
+        models: ["model-1"],
+        activeKeyIndex: 0,
+      },
+    });
+
+    const configs = await loadConfigs(storage);
+    const config = configs.get("test")!;
+    expect(config.baseUrls).toEqual(["https://a.example.com/v1", "https://b.example.com/v1"]);
+    expect(config.apiKeys).toEqual(["key-a1", "key-b1", "key-b2"]);
+    expect(config.models).toEqual([{ name: "model-1", providerName: "model-1" }]);
+  });
+
+  it("sorts object-format baseUrl and apiKeys by key", async () => {
+    const storage = mockStorageWithRaw({
+      test: {
+        apiKeys: { z: ["key-z"], a: ["key-a"] },
+        baseUrl: { z: "https://z.example.com/v1", a: "https://a.example.com/v1" },
+        models: ["model-1"],
+        activeKeyIndex: 0,
+      },
+    });
+
+    const configs = await loadConfigs(storage);
+    const config = configs.get("test")!;
+    expect(config.baseUrls).toEqual(["https://a.example.com/v1", "https://z.example.com/v1"]);
+    expect(config.apiKeys).toEqual(["key-a", "key-z"]);
+  });
+
+  it("rejects mismatched baseUrl and apiKeys formats", async () => {
+    const storage = mockStorageWithRaw({
+      test: {
+        apiKeys: ["key1"],
+        baseUrl: { a: "https://a.example.com/v1" },
+        models: ["model-1"],
+        activeKeyIndex: 0,
+      },
+    });
+
+    const configs = await loadConfigs(storage);
+    expect(configs.has("test")).toBe(false);
   });
 });
 

@@ -30,7 +30,7 @@ function mockStorage(
 const providerConfigs: Record<string, ProviderConfig> = {
   "openai": {
     apiKeys: ["sk-openai-1"],
-    baseUrl: "https://api.openai.com/v1",
+    baseUrls: ["https://api.openai.com/v1"],
     models: [
       { name: "gpt-4o", providerName: "gpt-4o" },
       { name: "o1", providerName: "o1-2024-12-17" },
@@ -125,7 +125,7 @@ describe("Model List", () => {
       "openai": providerConfigs["openai"],
       "deepseek": {
         apiKeys: ["sk-ds-1"],
-        baseUrl: "https://api.deepseek.com/v1",
+        baseUrls: ["https://api.deepseek.com/v1"],
         models: [
           { name: "deepseek-chat", providerName: "deepseek-chat" },
           { name: "o1", providerName: "deepseek-o1" },

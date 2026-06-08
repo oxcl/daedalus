@@ -194,7 +194,6 @@ async function tryProvider(
 }
 
 async function tryProviderWithKeyRotation(
-  baseUrl: string,
   body: Record<string, unknown>,
   providerConfig: ProviderConfig,
   providerModelName: string,
@@ -206,6 +205,7 @@ async function tryProviderWithKeyRotation(
 
   for (let attempt = 0; attempt < numKeys; attempt++) {
     providerConfig.activeKeyIndex = currentKeyIndex;
+    const baseUrl = providerConfig.baseUrls[currentKeyIndex % providerConfig.baseUrls.length];
     const upstreamRequest = buildUpstreamRequest(baseUrl, body, providerConfig, providerModelName);
     const result = await tryProvider(upstreamRequest, isStreaming);
 
@@ -262,7 +262,6 @@ export async function handleChatCompletions(
     const providerConfig = { ...resolution.providerConfig };
 
     const response = await tryProviderWithKeyRotation(
-      resolution.providerConfig.baseUrl,
       body,
       providerConfig,
       resolution.providerModelName,
