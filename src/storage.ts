@@ -17,7 +17,7 @@ interface ConfigFile {
 
 interface KeysFile {
   [provider: string]: {
-    apiKeys: string[] | Record<string, string[]>;
+    apiKeys: string[];
     activeKeyIndex: number;
   };
 }
